@@ -1,371 +1,446 @@
-# IOCL Enterprise GraphRAG
+Enterprise Hybrid GraphRAG
 
-An enterprise document question-answering system designed to retrieve evidence from organizational documents, generate evidence-grounded responses, validate citations, and verify factual claims before accepting an answer.
+An enterprise-grade Hybrid GraphRAG question-answering system that combines semantic vector search, knowledge-graph retrieval, cross-encoder reranking, grounded LLM generation, citation validation, and NLI-based factual verification.
 
-## Overview
+Built as part of an enterprise AI/ML internship project to improve document question answering beyond naïve RAG.
 
-The system combines semantic vector retrieval and knowledge-graph retrieval to provide grounded question answering over enterprise documents.
+Overview
 
-The pipeline follows:
+Traditional RAG systems often retrieve semantically similar chunks but can miss relationships between entities, policies, roles, and processes spread across multiple documents.
 
-```text
-Enterprise Documents
+This project addresses that limitation with a Hybrid GraphRAG pipeline that combines:
+
+FAISS semantic retrieval
+
+Neo4j Knowledge Graph retrieval
+
+Cross-encoder reranking
+
+Relevance gating
+
+Evidence selection and context building
+
+Grounded LLM generation
+
+Source/page citations
+
+NLI-based claim verification
+
+Deterministic answer repair and acceptance checks
+
+The goal is a single enterprise assistant that can automatically identify relevant evidence across heterogeneous documents without requiring users to manually select a department, assistant, or filename.
+
+Key Features
+
+Hybrid Retrieval
+
+Uses both vector and graph retrieval to capture:
+
+semantic similarity
+
+entity relationships
+
+cross-document connections
+
+policy/process dependencies
+
+Knowledge Graph
+
+Stores extracted entities and relationships in Neo4j, enabling graph-aware retrieval alongside semantic search.
+
+Semantic Search
+
+Uses multilingual Sentence Transformer embeddings with FAISS for efficient document retrieval.
+
+Cross-Encoder Reranking
+
+Retrieved candidates are reranked using a cross-encoder to improve query-document relevance.
+
+Relevance Gate
+
+Rejects weak or unsupported retrieval results before answer generation.
+
+Grounded Generation
+
+The LLM is instructed to answer only from retrieved enterprise evidence.
+
+Citation Validation
+
+Generated citations are checked against retrieved evidence and document provenance.
+
+NLI Grounding
+
+A DeBERTa NLI model validates whether generated factual claims are:
+
+entailed
+
+neutral
+
+contradicted
+
+Unsupported content can be removed before the final response is accepted.
+
+Abstention
+
+If sufficient evidence is not available, the system can return an insufficient evidence response instead of hallucinating.
+
+OpenAI-Compatible API
+
+The backend exposes OpenAI-compatible endpoints so it can integrate with interfaces such as Open WebUI.
+
+System Architecture
+
+User / Open WebUI
         |
         v
-Document Ingestion
+FastAPI Backend
         |
         v
-Chunking + Metadata
+Query
         |
-        +--------------------+
-        |                    |
-        v                    v
-Vector Index          Knowledge Graph
-   FAISS                  Neo4j
-        |                    |
-        +---------+----------+
+        +-------------------+
+        |                   |
+        v                   v
+FAISS Vector Search     Neo4j Graph Search
+        |                   |
+        +---------+---------+
                   |
                   v
-           Hybrid Retrieval
+          Hybrid Candidate Set
                   |
                   v
-              Reranking
+        Cross-Encoder Reranking
                   |
                   v
-            Context Builder
+            Relevance Gate
                   |
                   v
-          Gemini Generation
+          Evidence Selection
                   |
                   v
-        Citation Validation
+           Context Builder
                   |
                   v
-        NLI Claim Grounding
-                  |
-             +----+----+
-             |         |
-           PASS       FAIL
-             |         |
-             |      Repair
-             |         |
-             +----+----+
+         LLM Generation Layer
                   |
                   v
-          Verified Response
-```
+         Citation Validation
+                  |
+                  v
+       DeBERTa NLI Verification
+                  |
+                  v
+      Repair / Acceptance Gate
+                  |
+                  v
+          Final Grounded Answer
 
-## Core Features
+Tech Stack
 
-- Multi-format enterprise document ingestion
-- PDF, DOCX, PPTX and XLSX support
-- Metadata-aware document chunking
-- FAISS semantic vector retrieval
-- Neo4j knowledge graph
-- Semantic entity linking
-- Hybrid graph + vector retrieval
-- Candidate reranking
-- Context construction
-- Evidence-grounded Gemini answer generation
-- Inline evidence citations
-- Citation validation
-- NLI-based claim grounding
-- Answer repair
-- Insufficient-evidence handling
-- Provider/API failure handling with bounded retries
-- FastAPI REST API
-- Responsive browser interface
-- Pipeline performance metrics
+Layer
 
-## Technology Stack
+Technology
 
-### AI and Retrieval
+Language
 
-- Google Gemini
-- Sentence Transformers
-- Hugging Face Transformers
-- PyTorch
-- FAISS
+Python
 
-### Knowledge Graph
+API
 
-- Neo4j
+FastAPI, Uvicorn
 
-### API
+Vector Search
 
-- FastAPI
-- Uvicorn
-- Pydantic
+FAISS
 
-### Document Processing
+Knowledge Graph
 
-- PyMuPDF
-- python-docx
-- python-pptx
-- openpyxl
+Neo4j
 
-## Project Structure
+Embeddings
 
-```text
-Knowledge Graph/
-|
-|-- data/
-|
-|-- scripts/
-|   |-- build_base_graph.py
-|   |-- build_knowledge_graph.py
-|   |-- build_vector_index.py
-|   |-- process_corpus.py
-|   `-- test_*.py
-|
-|-- src/
-|   |
-|   |-- api/
-|   |   |-- app.py
-|   |   `-- index.html
-|   |
-|   |-- generation/
-|   |   |-- answer_generator.py
-|   |   |-- answer_repairer.py
-|   |   |-- answer_validator.py
-|   |   |-- context_builder.py
-|   |   |-- grounding_validator.py
-|   |   `-- qa_pipeline.py
-|   |
-|   |-- graph/
-|   |   |-- entity_extractor.py
-|   |   |-- extraction_cache.py
-|   |   `-- neo4j_store.py
-|   |
-|   |-- ingestion/
-|   |   |-- chunker.py
-|   |   |-- document_loader.py
-|   |   `-- processor.py
-|   |
-|   `-- retrieval/
-|       |-- graph_retriever.py
-|       |-- hybrid_retriever.py
-|       |-- relevance_gate.py
-|       |-- reranker.py
-|       |-- semantic_entity_linker.py
-|       `-- vector_store.py
-|
-|-- requirements.txt
-|-- .env
-|-- .gitignore
-`-- README.md
-```
+Sentence Transformers
 
-## Environment Setup
+Reranking
 
-Python virtual environment:
+Cross-Encoder
 
-```bash
-python -m venv .venv
-```
+LLM Integration
 
-Windows:
+Ollama-compatible / configurable provider
 
-```bash
-.venv\Scripts\activate
-```
+Grounding
 
-Install dependencies:
+DeBERTa NLI
 
-```bash
-python -m pip install -r requirements.txt
-```
+Inference Runtime
 
-## Environment Configuration
+ONNX Runtime
 
-Create a `.env` file in the project root.
+Validation
 
-Required configuration includes the Gemini API key and Neo4j connection information used by the application.
+Deterministic citation + grounding checks
+
+Repository Structure
+
+enterprise-hybrid-graphrag/
+├── src/
+│   ├── api/
+│   ├── config/
+│   ├── generation/
+│   ├── graph/
+│   ├── ingestion/
+│   └── retrieval/
+├── scripts/
+├── tests/
+├── data/
+├── .env.example
+├── .gitignore
+├── requirements.txt
+└── README.md
+
+End-to-End Pipeline
+
+1. Document Ingestion
+
+Documents
+   ↓
+Parsing / Cleaning
+   ↓
+Chunking
+   ↓
+Metadata + Provenance
+   ↓
+Embeddings → FAISS
+   ↓
+Entity / Relationship Extraction → Neo4j
+
+2. Query Processing
+
+Question
+   ↓
+Vector Retrieval + Graph Retrieval
+   ↓
+Hybrid Fusion
+   ↓
+Cross-Encoder Reranking
+   ↓
+Relevance Filtering
+
+3. Answer Generation
+
+Selected Evidence
+   ↓
+Context Builder
+   ↓
+LLM
+   ↓
+Grounded Answer + Citations
+
+4. Verification
+
+Generated Answer
+   ↓
+Citation Validation
+   ↓
+Claim Extraction
+   ↓
+NLI Grounding
+   ↓
+Repair if Required
+   ↓
+Final Acceptance / Abstention
+
+Example Capabilities
+
+The system is designed to handle:
+
+direct factual questions
+
+paraphrased questions
+
+policy and compliance queries
+
+cross-document reasoning
+
+process and approval-chain questions
+
+enterprise document summaries
+
+unsupported/out-of-domain questions with abstention
 
 Example:
 
-```env
-GEMINI_API_KEY=your_api_key
-GEMINI_MODEL=gemini-3.6-flash
+Question:
+How are whistleblowers protected?
 
-NEO4J_URI=your_neo4j_uri
-NEO4J_USERNAME=your_username
-NEO4J_PASSWORD=your_password
-```
+System:
+→ retrieves relevant policy evidence
+→ reranks the strongest passages
+→ generates an evidence-constrained answer
+→ attaches source/page citations
+→ verifies factual claims using NLI
+→ returns the final grounded response
 
-Never commit `.env` or production credentials to source control.
+Open WebUI Integration
 
-## Running the API
+The GraphRAG backend can be exposed as an OpenAI-compatible provider.
 
-From the project root with the virtual environment activated:
+Main endpoints:
 
-```bash
-python -m uvicorn src.api.app:app --host 127.0.0.1 --port 8000
-```
+GET  /health
+GET  /v1/models
+POST /v1/chat/completions
 
-The application initializes the retrieval and grounding models during startup.
+Typical deployment flow:
 
-Open the application at:
+Open WebUI
+    ↓
+GraphRAG FastAPI
+    ↓
+FAISS + Neo4j
+    ↓
+LLM via Ollama
+    ↓
+Citation + NLI Validation
+    ↓
+Open WebUI
 
-```text
-http://127.0.0.1:8000
-```
+This allows the retrieval and grounding layer to remain independent from the user interface.
 
-Health endpoint:
+Environment Configuration
 
-```text
-GET /health
-```
+Create a .env file from .env.example.
 
-Question-answering endpoint:
+Example:
 
-```text
-POST /ask
-```
+OLLAMA_BASE_URL=http://<ollama-server>:11434
+OLLAMA_MODEL=<model-name>
 
-## Verification Philosophy
+NEO4J_URI=bolt://<neo4j-server>:7687
+NEO4J_USER=<username>
+NEO4J_PASSWORD=<password>
 
-The system does not treat successful LLM generation as sufficient for answer acceptance.
+DOCUMENT_ROOT=/path/to/documents
 
-Generated answers pass through additional verification stages including citation validation and NLI-based claim grounding.
+Never commit real credentials, internal server addresses, or confidential enterprise documents.
 
-A response may therefore be generated but rejected if its factual claims cannot be sufficiently supported by the retrieved evidence.
+Installation
 
-The system also distinguishes between:
+git clone https://github.com/abheer2005/enterprise-hybrid-graphrag.git
+cd enterprise-hybrid-graphrag
 
-- insufficient document evidence,
-- an unverified/generated answer,
-- provider or generation failure,
-- and a successfully verified response.
+python -m venv .venv
 
-## Reliability
+Windows:
 
-Temporary generation-provider failures use bounded retry handling.
+.venv\Scripts\activate
 
-Non-retryable failures are not repeatedly sent to the provider.
+Linux/macOS:
 
-If generation cannot be completed reliably, the QA pipeline returns a safe unaccepted result rather than allowing the complete application request to crash.
+source .venv/bin/activate
 
-## Performance
+Install dependencies:
 
-Pipeline timing information is recorded for major stages including:
+pip install -r requirements.txt
 
-- retrieval
-- reranking
-- context building
-- generation
-- citation validation
-- NLI grounding
-- answer repair
+Run the API
 
-Development testing identified local CPU NLI inference as the primary latency bottleneck.
+python -m uvicorn src.api.app:app --host 0.0.0.0 --port 8001
 
-This is a deployment-performance consideration rather than a reason to remove claim verification. Production environments may use accelerated inference, suitable hardware, caching, batching, or other deployment optimizations while retaining the verification architecture.
+Health check:
 
-## Security Notes
+GET http://localhost:8001/health
 
-- API keys and database credentials are loaded from environment variables.
-- `.env` is excluded through `.gitignore`.
-- Credentials should never be embedded in application source code.
-- Internal provider errors should be logged server-side rather than exposed to normal end users.
-- Production deployment should add organization-appropriate authentication, authorization, network controls and secret management.
+Engineering Highlights
 
-## Validation
+Hybrid vector + graph retrieval instead of naïve RAG
 
-The project contains tests covering major components of the system, including:
+Cross-encoder reranking for stronger relevance
 
-- ingestion
-- chunking
-- vector search
-- graph retrieval
-- semantic entity linking
-- hybrid retrieval
-- relevance gating
-- context building
-- answer generation
-- citation validation
-- claim grounding
-- answer repair
-- QA failure paths
-- end-to-end QA evaluation
+Provenance-aware evidence handling
 
-## Deployment Considerations
+Source/page-level citation support
 
-Before organization-wide production deployment, infrastructure-specific decisions should be made for:
+NLI-based hallucination detection
 
-- authentication and authorization
-- TLS/HTTPS
-- enterprise secret management
-- request rate limiting
-- audit logging
-- monitoring and observability
-- model hosting/inference hardware
-- backup and recovery
-- Neo4j production configuration
-- document-access permissions
-- horizontal scaling
-- CI/CD
+Deterministic answer repair
 
-These controls depend on the target enterprise infrastructure and are intentionally separate from the core GraphRAG implementation.
+Unsupported-query abstention
 
-## Status
+Persistent vector and graph indexes
 
-**Version:** 1.0.0
+API-first architecture
 
-The v1 system implements the complete enterprise GraphRAG question-answering workflow from document ingestion and hybrid retrieval through grounded generation, citation validation and claim-level verification.
-# IOCL Enterprise Hybrid GraphRAG
+OpenAI-compatible integration layer
 
-This backend exposes one enterprise assistant over a persistent document
-knowledge base. Routing is implicit: semantic vector retrieval and knowledge-
-graph entity linking infer the relevant documents from each question. No
-department names or assistant selection rules are hard-coded.
+Designed for heterogeneous enterprise documents
 
-## Production data paths
+Why Hybrid GraphRAG?
 
-- `data/raw/`: permanent managed corpus. `scripts/process_corpus.py` performs a
-  snapshot update, skips unchanged files, replaces changed versions, and removes
-  documents no longer present.
-- `data/processed/`: chunk records and the persistent vector index. The vector
-  builder reuses embeddings for unchanged chunk IDs.
-- Neo4j: document, chunk, entity, relationship, and provenance graph.
-- `POST /v1/temporary-file`: isolated ad-hoc analysis. Its bytes are deleted at
-  request completion and never enter the permanent indexes or graph.
+A pure vector RAG system is effective for semantic similarity but may struggle when answers depend on relationships such as:
 
-Each permanent source receives a stable `document_id`, relative source URI,
-SHA-256 content fingerprint, version, lifecycle status, timestamps, and exact
-page/slide/sheet/chunk provenance. Optional governance metadata belongs in a
-sidecar named `document.ext.metadata.json`, for example:
+Policy → Approval Authority
+Role → Responsibility
+Process → Requirement
+Document → Regulation
+Entity → Related Entity
 
-```json
-{
-  "document_version": "2026.2",
-  "status": "current",
-  "effective_from": "2026-04-01",
-  "effective_to": null,
-  "supersedes": "previous-document-id",
-  "owner": "document owner",
-  "classification": "internal"
-}
-```
+A knowledge graph provides relationship-aware retrieval, while vector search provides semantic flexibility.
 
-Inactive statuses (`obsolete`, `superseded`, `revoked`, `expired`) are excluded
-from normal vector and graph retrieval. This is metadata-driven and remains
-generic across future domains.
+Combining both helps create a stronger enterprise retrieval system.
 
-## API integration
+Future Improvements
 
-Use `POST /v1/ask` from IOCL's existing UI:
+incremental document ingestion
 
-```json
-{"query": "What procedure applies when ...?"}
-```
+document version/conflict handling
 
-Retrieval limits and acceptance policy are server-controlled on this endpoint.
-The legacy `/ask` endpoint remains available for backward compatibility and
-testing. Answers are accepted only after citation validation and claim-level NLI
-grounding (or safe removal of unsupported claims); otherwise the service returns
-an evidence-insufficiency or non-acceptance response.
+graph entity normalization
 
-For a temporary file, send the raw file bytes to `POST /v1/temporary-file` with
-`X-Filename` and optional `X-Instruction` headers. The default size limit is
-25 MiB and can be changed with `TEMP_UPLOAD_MAX_BYTES`.
+improved graph candidate filtering
+
+asynchronous ingestion jobs
+
+GPU-accelerated NLI
+
+streaming chat responses
+
+authentication and role-based access control
+
+monitoring and observability
+
+retrieval/evaluation dashboards
+
+Security & Confidentiality
+
+This repository contains the application architecture and implementation only.
+
+It should not contain:
+
+confidential enterprise documents
+
+real API keys
+
+passwords
+
+internal server credentials
+
+proprietary production data
+
+private vector indexes built from confidential documents
+
+Use .env.example for configuration placeholders and keep the actual .env private.
+
+Author
+
+Abheer Agarwal
+
+B.Tech Computer Science & Engineering
+Focused on AI/ML, LLMs, RAG, GraphRAG, Knowledge Graphs and enterprise AI systems.
+
+GitHub: abheer2005
+
+Disclaimer
+
+This repository represents an engineering project/prototype and should not be interpreted as an official public deployment or product of any organization. Enterprise deployment details, credentials, and proprietary documents are intentionally excluded
