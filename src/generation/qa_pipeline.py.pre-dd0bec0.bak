@@ -1,0 +1,1499 @@
+from dataclasses import dataclass
+from typing import Any
+import time
+
+from src.config.retrieval_config import RetrievalConfig
+
+from src.retrieval.hybrid_retriever import (
+    HybridRetriever,
+)
+
+from src.retrieval.reranker import (
+    HybridReranker,
+)
+
+from src.retrieval.relevance_gate import (
+    RelevanceGate,
+)
+
+from src.generation.context_builder import (
+    ContextBuilder,
+)
+
+from src.generation.answer_generator import (
+    AnswerGenerator,
+)
+
+from src.generation.answer_validator import (
+    AnswerValidator,
+)
+
+from src.generation.grounding_validator import (
+    GroundingValidator,
+)
+
+from src.generation.answer_repairer import (
+    AnswerRepairer,
+)
+
+
+@dataclass
+class QAResult:
+    """
+    Final result returned by the IOCL GraphRAG pipeline.
+    """
+
+    query: str
+    answer: str
+    accepted: bool
+    grounded: bool
+    insufficient_evidence: bool
+    sources: list[dict[str, Any]]
+    citation_validation: dict[str, Any]
+    grounding_validation: Any
+    retrieval_stats: dict[str, Any]
+    context_stats: dict[str, Any]
+    failure_reasons: list[str]
+    repair: dict[str, Any]
+    relevance: dict[str, Any]
+
+    # Stage-level performance information.
+    performance: dict[str, float]
+
+
+class QAPipeline:
+    """
+    End-to-end IOCL GraphRAG question-answering pipeline.
+
+    Flow:
+
+        User Query
+              ↓
+        Hybrid Retrieval
+              ↓
+        Semantic Reranking
+              ↓
+        Retrieval Relevance Gate
+              ↓
+        Context Builder
+              ↓
+        Answer Generator
+              ↓
+        Citation Validation
+              ↓
+        NLI Claim Grounding
+              ↓
+        Optional Answer Repair
+              ↓
+        Citation Revalidation
+              ↓
+        Acceptance Gate
+              ↓
+        Final Answer + Provenance
+
+    Important:
+
+    A generated answer is never trusted merely because
+    the LLM produced it.
+
+    Normal factual answers must have:
+
+        1. Valid citations.
+        2. Grounded factual claims.
+
+    If only part of an answer fails claim grounding,
+    unsupported answer fragments may be removed while
+    supported content is preserved.
+
+    Repair never invents new information and does not
+    require another LLM call.
+
+    This version additionally records stage-level
+    performance timings without changing QA behavior.
+    """
+
+    SAFE_FAILURE_MESSAGE = (
+        "I could not verify the generated answer against "
+        "the available IOCL document evidence reliably."
+    )
+
+    EVIDENCE_GAP_MESSAGE = (
+        "The available IOCL documents contain information "
+        "relevant to this question, but I could not verify "
+        "the specific answer from the retrieved evidence "
+        "reliably."
+    )
+
+    def __init__(
+        self,
+        api_key: str,
+        model_name: str = "gemini-3.6-flash",
+        max_context_chunks: int = 12,
+        max_context_chars: int = 20000,
+        min_entailment_score: float = 0.70,
+    ):
+
+        # -------------------------------------------------
+        # 1. RETRIEVAL
+        # -------------------------------------------------
+
+        self.retriever = HybridRetriever()
+
+        # -------------------------------------------------
+        # 2. RERANKER
+        #
+        # Reuse the SAME embedding model already loaded
+        # inside VectorStore.
+        # -------------------------------------------------
+
+        self.reranker = HybridReranker(
+            embedding_model=(
+                self.retriever.vector_store.model
+            ),
+        )
+
+        # -------------------------------------------------
+        # 2A. RETRIEVAL RELEVANCE GATE
+        # -------------------------------------------------
+
+        self.relevance_gate = RelevanceGate()
+
+        # -------------------------------------------------
+        # 3. CONTEXT BUILDER
+        # -------------------------------------------------
+
+        self.context_builder = ContextBuilder(
+            max_chunks=max_context_chunks,
+            max_chars=max_context_chars,
+        )
+
+        # -------------------------------------------------
+        # 4. ANSWER GENERATOR
+        # -------------------------------------------------
+
+        self.generator = AnswerGenerator(
+            api_key=api_key,
+            model_name=model_name,
+        )
+
+        # -------------------------------------------------
+        # 5. CITATION VALIDATOR
+        # -------------------------------------------------
+
+        self.answer_validator = AnswerValidator(
+            require_citations=True,
+        )
+
+        # -------------------------------------------------
+        # 6. NLI CLAIM GROUNDING VALIDATOR
+        # -------------------------------------------------
+
+        self.grounding_validator = (
+            GroundingValidator(
+                min_entailment_score=(
+                    min_entailment_score
+                ),
+            )
+        )
+
+        # -------------------------------------------------
+        # 7. ANSWER REPAIRER
+        # -------------------------------------------------
+
+        self.answer_repairer = (
+            AnswerRepairer(
+                min_supported_claims=1,
+            )
+        )
+
+    # =====================================================
+    # PROFILING HELPERS
+    # =====================================================
+
+    @staticmethod
+    def _elapsed(
+        start: float,
+    ) -> float:
+        """
+        Return elapsed wall-clock time in seconds.
+
+        perf_counter() is used because it is appropriate
+        for measuring execution duration.
+        """
+
+        return round(
+            time.perf_counter() - start,
+            4,
+        )
+
+    def _expand_adjacent_evidence(
+        self,
+        candidates: list[dict[str, Any]],
+        max_added: int = 4,
+        min_anchor_score: float = 0.50,
+    ) -> list[dict[str, Any]]:
+        """Add neighboring pages beside strong anchors before context building.
+
+        Policies commonly place definitions, approvals, exceptions, and
+        thresholds on consecutive pages. Expansion is provenance-driven and
+        contains no document, department, or domain rules.
+        """
+        expanded = []
+        seen = set()
+        added = 0
+        vector_store = self.retriever.vector_store
+
+        for candidate in candidates:
+            chunk_id = candidate.get("chunk_id")
+            if chunk_id not in seen:
+                expanded.append(candidate)
+                seen.add(chunk_id)
+
+            if added >= max_added:
+                continue
+            anchor_score = float(candidate.get("cross_encoder_score", 0.0) or 0.0)
+            metadata = candidate.get("metadata", {})
+            source = metadata.get("source")
+            page = metadata.get("page")
+            if anchor_score < min_anchor_score or not source or not isinstance(page, int):
+                continue
+
+            for record in vector_store.adjacent_records(source, page, radius=1):
+                neighbor_id = record.get("chunk_id")
+                if neighbor_id in seen:
+                    continue
+                expanded.append({
+                    "chunk_id": neighbor_id,
+                    "text": record.get("text", ""),
+                    "metadata": record.get("metadata", {}),
+                    "context_expansion": True,
+                    "anchor_chunk_id": chunk_id,
+                    "retrieval_sources": ["adjacent_page"],
+                })
+                seen.add(neighbor_id)
+                added += 1
+                if added >= max_added:
+                    break
+
+        return expanded
+
+    @staticmethod
+    def _empty_performance() -> dict[str, float]:
+        """
+        Create the complete performance structure.
+
+        Every result contains the same fields, including
+        early exits from the relevance gate.
+        """
+
+        return {
+            "retrieval_seconds": 0.0,
+            "reranking_seconds": 0.0,
+            "relevance_gate_seconds": 0.0,
+            "context_building_seconds": 0.0,
+            "generation_seconds": 0.0,
+            "citation_validation_seconds": 0.0,
+            "nli_grounding_seconds": 0.0,
+            "repair_seconds": 0.0,
+            "repair_citation_validation_seconds": 0.0,
+            "pipeline_processing_seconds": 0.0,
+            "total_seconds": 0.0,
+        }
+
+    @staticmethod
+    def _build_sources(
+        citation_validation: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """
+        Return only sources actually cited by the final
+        accepted answer.
+        """
+
+        return list(
+            citation_validation.get(
+                "cited_sources",
+                [],
+            )
+            or []
+        )
+
+    @staticmethod
+    def _grounding_summary(
+        grounding_result,
+    ) -> dict[str, Any]:
+        """
+        Convert GroundingValidationResult into a simple,
+        serializable structure.
+        """
+
+        claims = []
+
+        for claim in grounding_result.claims:
+
+            claims.append(
+                {
+                    "claim": claim.claim,
+
+                    "citations": (
+                        claim.citations
+                    ),
+
+                    "supported": (
+                        claim.supported
+                    ),
+
+                    "label": claim.label,
+
+                    "entailment_score": (
+                        claim.entailment_score
+                    ),
+
+                    "contradiction_score": (
+                        claim.contradiction_score
+                    ),
+
+                    "neutral_score": (
+                        claim.neutral_score
+                    ),
+
+                    "evidence_ids": (
+                        claim.evidence_ids
+                    ),
+                }
+            )
+
+        return {
+            "passed": (
+                grounding_result.passed
+            ),
+
+            "claims_checked": len(
+                grounding_result.claims
+            ),
+
+            "supported_claims": len(
+                grounding_result.supported_claims
+            ),
+
+            "unsupported_claims": len(
+                grounding_result.unsupported_claims
+            ),
+
+            "claims": claims,
+        }
+
+    @staticmethod
+    def _empty_repair_state() -> dict[str, Any]:
+        """
+        Default repair metadata.
+
+        Useful for answers that did not require repair.
+        """
+
+        return {
+            "attempted": False,
+            "changed": False,
+            "usable": False,
+            "supported_claims": 0,
+            "unsupported_claims": 0,
+            "removed_fragments": [],
+        }
+
+    def run(
+        self,
+        query: str,
+        vector_top_k: int = 75,
+        entity_limit: int = 10,
+        relation_limit: int = 10,
+        semantic_min_score: float = 0.18,
+        hybrid_top_k: int = 30,
+        rerank_top_k: int = 20,
+    ) -> QAResult:
+        """
+        Run the complete GraphRAG QA pipeline for one query.
+        """
+
+        pipeline_start = time.perf_counter()
+
+        performance = (
+            self._empty_performance()
+        )
+
+        # =================================================
+        # STEP 1
+        # HYBRID RETRIEVAL
+        # =================================================
+
+        stage_start = time.perf_counter()
+
+        retrieval = (
+            self.retriever.retrieve(
+                query=query,
+
+                vector_top_k=(
+                    vector_top_k
+                ),
+
+                entity_limit=(
+                    entity_limit
+                ),
+
+                relation_limit=(
+                    relation_limit
+                ),
+
+                semantic_min_score=(
+                    semantic_min_score
+                ),
+
+                final_top_k=(
+                    hybrid_top_k
+                ),
+            )
+        )
+
+        performance[
+            "retrieval_seconds"
+        ] = self._elapsed(
+            stage_start
+        )
+
+        hybrid_candidates = (
+            retrieval.get(
+                "candidates",
+                [],
+            )
+        )
+
+        # =================================================
+        # STEP 2
+        # CROSS-ENCODER RERANK
+        # =================================================
+
+        stage_start = time.perf_counter()
+
+        reranked_candidates = self.reranker.rerank(
+            query=query,
+            candidates=hybrid_candidates,
+            top_k=rerank_top_k,
+        )
+
+        performance[
+            "reranking_seconds"
+        ] = self._elapsed(
+            stage_start
+        )
+
+        # =================================================
+        # STEP 2A
+        # RETRIEVAL RELEVANCE GATE
+        # =================================================
+
+        stage_start = time.perf_counter()
+
+        relevance_decision = (
+            self.relevance_gate.evaluate(
+                candidates=reranked_candidates,
+            )
+        )
+
+        performance[
+            "relevance_gate_seconds"
+        ] = self._elapsed(
+            stage_start
+        )
+
+        relevance_summary = {
+            "status": relevance_decision.status,
+            "allow_generation": relevance_decision.allow_generation,
+            "top_semantic_score": relevance_decision.top_semantic_score,
+            "mean_top_semantic_score": relevance_decision.mean_top_semantic_score,
+            "top_rerank_score": relevance_decision.top_rerank_score,
+            "mean_top_rerank_score": relevance_decision.mean_top_rerank_score,
+            "strong_semantic_matches": relevance_decision.strong_semantic_matches,
+            "moderate_semantic_matches": relevance_decision.moderate_semantic_matches,
+            "vector_graph_agreements": relevance_decision.vector_graph_agreements,
+            "reason": relevance_decision.reason,
+        }
+
+        if not relevance_decision.allow_generation:
+
+            retrieval_stats = dict(
+                retrieval.get(
+                    "stats",
+                    {},
+                )
+            )
+
+            retrieval_stats[
+                "hybrid_candidates"
+            ] = len(
+                hybrid_candidates
+            )
+
+            retrieval_stats[
+                "reranked_candidates"
+            ] = len(
+                reranked_candidates
+            )
+
+            retrieval_stats[
+                "relevance_status"
+            ] = (
+                relevance_decision.status
+            )
+
+            retrieval_stats[
+                "relevance_allow_generation"
+            ] = False
+
+            performance[
+                "total_seconds"
+            ] = self._elapsed(
+                pipeline_start
+            )
+
+            performance[
+                "pipeline_processing_seconds"
+            ] = performance[
+                "total_seconds"
+            ]
+
+            return QAResult(
+                query=query,
+
+                answer=(
+                    "I could not find sufficiently relevant "
+                    "information in the available IOCL "
+                    "document evidence to answer this "
+                    "question reliably."
+                ),
+
+                accepted=False,
+
+                grounded=False,
+
+                insufficient_evidence=True,
+
+                sources=[],
+
+                citation_validation={
+                    "validation_passed": True,
+                    "citation_valid": True,
+                    "cited_evidence_ids": [],
+                    "invalid_citation_ids": [],
+                    "cited_sources": [],
+                    "insufficient_evidence": True,
+                    "skipped": True,
+                    "reason": (
+                        "Generation blocked by retrieval "
+                        "relevance gate."
+                    ),
+                },
+
+                grounding_validation={
+                    "passed": True,
+                    "skipped": True,
+                    "reason": (
+                        "Generation blocked by retrieval "
+                        "relevance gate."
+                    ),
+                    "claims_checked": 0,
+                    "supported_claims": 0,
+                    "unsupported_claims": 0,
+                    "claims": [],
+                },
+
+                retrieval_stats=(
+                    retrieval_stats
+                ),
+
+                context_stats={
+                    "input_candidates": 0,
+                    "selected_chunks": 0,
+                    "context_chars": 0,
+                    "max_chunks": (
+                        self.context_builder.max_chunks
+                    ),
+                    "max_chars": (
+                        self.context_builder.max_chars
+                    ),
+                },
+
+                failure_reasons=[
+                    (
+                        "Query was rejected by the retrieval "
+                        "relevance gate: "
+                        + relevance_decision.reason
+                    )
+                ],
+
+                repair=(
+                    self._empty_repair_state()
+                ),
+
+                relevance=(
+                    relevance_summary
+                ),
+
+                performance=(
+                    performance
+                ),
+            )
+
+        # =================================================
+        # STEP 3
+        # BUILD CONTEXT
+        # =================================================
+
+        stage_start = time.perf_counter()
+
+        context_result = (
+            self.context_builder.build(
+                candidates=(
+                    self._expand_adjacent_evidence(
+                        reranked_candidates
+                    )
+                ),
+            )
+        )
+
+        performance[
+            "context_building_seconds"
+        ] = self._elapsed(
+            stage_start
+        )
+
+        evidence = (
+            context_result.get(
+                "evidence",
+                [],
+            )
+        )
+
+              # =================================================
+        # STEP 4
+        # GENERATE ANSWER
+        # =================================================
+        #
+        # Production safety:
+        #
+        # AnswerGenerator is responsible for retrying
+        # temporary provider/API failures.
+        #
+        # If generation still fails after those retries,
+        # the exception must NOT crash the complete QA
+        # pipeline.
+        #
+        # IMPORTANT:
+        #
+        # A generation/provider failure is NOT the same as
+        # insufficient document evidence.
+        #
+        # Therefore:
+        #
+        #     accepted = False
+        #     grounded = False
+        #     insufficient_evidence = False
+        #
+        # Retrieval/relevance/context information and
+        # performance timings are preserved for diagnosis.
+        # =================================================
+
+        stage_start = time.perf_counter()
+
+        print(
+            "\n[QA PROFILE] Starting Gemini generation...",
+            flush=True,
+        )
+
+        try:
+
+            generated = (
+                self.generator.generate(
+                    query=query,
+
+                    selected_chunks=(
+                        evidence
+                    ),
+                )
+            )
+
+        except Exception as exc:
+
+            performance[
+                "generation_seconds"
+            ] = self._elapsed(
+                stage_start
+            )
+
+            # ---------------------------------------------
+            # Preserve retrieval statistics.
+            # ---------------------------------------------
+
+            retrieval_stats = dict(
+                retrieval.get(
+                    "stats",
+                    {},
+                )
+            )
+
+            retrieval_stats[
+                "hybrid_candidates"
+            ] = len(
+                hybrid_candidates
+            )
+
+            retrieval_stats[
+                "reranked_candidates"
+            ] = len(
+                reranked_candidates
+            )
+
+            retrieval_stats[
+                "relevance_status"
+            ] = (
+                relevance_decision.status
+            )
+
+            retrieval_stats[
+                "relevance_allow_generation"
+            ] = (
+                relevance_decision.allow_generation
+            )
+
+            # ---------------------------------------------
+            # Finish timing information.
+            # ---------------------------------------------
+
+            performance[
+                "total_seconds"
+            ] = self._elapsed(
+                pipeline_start
+            )
+
+            measured_stages = (
+                performance[
+                    "retrieval_seconds"
+                ]
+                + performance[
+                    "reranking_seconds"
+                ]
+                + performance[
+                    "relevance_gate_seconds"
+                ]
+                + performance[
+                    "context_building_seconds"
+                ]
+                + performance[
+                    "generation_seconds"
+                ]
+            )
+
+            performance[
+                "pipeline_processing_seconds"
+            ] = round(
+                measured_stages,
+                4,
+            )
+
+            # ---------------------------------------------
+            # Do NOT expose provider exception details in
+            # the user-facing answer.
+            #
+            # Keep diagnostic information in metadata.
+            # ---------------------------------------------
+
+            error_type = (
+                type(exc).__name__
+            )
+
+            error_message = (
+                str(exc).strip()
+                or "No provider error message was returned."
+            )
+
+            return QAResult(
+                query=query,
+
+                answer=(
+                    "I could not generate a verified answer "
+                    "from the available IOCL document evidence "
+                    "because the answer-generation service "
+                    "could not complete the request reliably."
+                ),
+
+                accepted=False,
+
+                grounded=False,
+
+                # Provider/generation failure does NOT mean
+                # that document evidence was insufficient.
+                insufficient_evidence=False,
+
+                sources=[],
+
+                citation_validation={
+                    "validation_passed": False,
+                    "citation_valid": False,
+                    "cited_evidence_ids": [],
+                    "invalid_citation_ids": [],
+                    "cited_sources": [],
+                    "insufficient_evidence": False,
+                    "skipped": True,
+                    "reason": (
+                        "Citation validation was skipped "
+                        "because answer generation failed."
+                    ),
+                },
+
+                grounding_validation={
+                    "passed": False,
+                    "skipped": True,
+                    "reason": (
+                        "NLI grounding was skipped because "
+                        "answer generation failed."
+                    ),
+                    "claims_checked": 0,
+                    "supported_claims": 0,
+                    "unsupported_claims": 0,
+                    "claims": [],
+                },
+
+                retrieval_stats=(
+                    retrieval_stats
+                ),
+
+                context_stats=(
+                    context_result.get(
+                        "stats",
+                        {},
+                    )
+                ),
+
+                failure_reasons=[
+                    (
+                        "Answer generation failed after "
+                        "generator retry handling. "
+                        f"Error type: {error_type}. "
+                        f"Provider message: {error_message}"
+                    )
+                ],
+
+                repair=(
+                    self._empty_repair_state()
+                ),
+
+                relevance=(
+                    relevance_summary
+                ),
+
+                performance=(
+                    performance
+                ),
+            )
+
+        performance[
+            "generation_seconds"
+        ] = self._elapsed(
+            stage_start
+        )
+
+        print(
+            "[QA PROFILE] Gemini generation finished: "
+            f"{performance['generation_seconds']:.2f}s",
+            flush=True,
+        )
+
+        raw_answer = (
+            generated.answer
+            or ""
+        ).strip()
+
+
+
+        print("\n" + "=" * 80)
+        print("RAW GEMINI ANSWER")
+        print("=" * 80)
+        print(raw_answer)
+        print("=" * 80 + "\n")
+
+        # The candidate answer may later become the repaired
+        # answer.
+
+        candidate_answer = (
+            raw_answer
+        )
+
+        repair_state = (
+            self._empty_repair_state()
+        )
+
+        # =================================================
+        # STEP 5
+        # INITIAL CITATION VALIDATION
+        # =================================================
+
+        stage_start = time.perf_counter()
+
+        citation_validation = (
+            self.answer_validator.validate(
+                answer=(
+                    candidate_answer
+                ),
+
+                evidence=(
+                    evidence
+                ),
+            )
+        )
+
+        performance[
+            "citation_validation_seconds"
+        ] = self._elapsed(
+            stage_start
+        )
+
+        insufficient = bool(
+            citation_validation.get(
+                "insufficient_evidence",
+                False,
+            )
+        )
+
+        citation_passed = bool(
+            citation_validation.get(
+                "validation_passed",
+                False,
+            )
+        )
+
+        # =================================================
+        # STEP 6
+        # CLAIM GROUNDING
+        # =================================================
+
+        if insufficient:
+
+            grounding_result = None
+
+            grounding_summary = {
+                "passed": True,
+                "skipped": True,
+
+                "reason": (
+                    "Explicit insufficient-evidence "
+                    "response."
+                ),
+
+                "claims_checked": 0,
+                "supported_claims": 0,
+                "unsupported_claims": 0,
+                "claims": [],
+            }
+
+        else:
+
+            stage_start = (
+                time.perf_counter()
+            )
+
+            print(
+                "\n[QA PROFILE] Starting NLI claim grounding...",
+                flush=True,
+            )
+        
+            grounding_result = (
+                self.grounding_validator.validate(
+                    answer=(
+                        candidate_answer
+                    ),
+
+                    evidence=(
+                        evidence
+                    ),
+                )
+            )
+
+            performance[
+                "nli_grounding_seconds"
+            ] = self._elapsed(
+                stage_start
+            )
+
+            print(
+                "[QA PROFILE] NLI claim grounding finished: "
+                f"{performance['nli_grounding_seconds']:.2f}s",
+                flush=True,
+            )
+
+
+            grounding_summary = (
+                self._grounding_summary(
+                    grounding_result
+                )
+            )
+
+        # =================================================
+        # STEP 7
+        # OPTIONAL ANSWER REPAIR
+        # =================================================
+        #
+        # If citation structure is valid but NLI rejected
+        # one or more claims, try preserving only the
+        # supported portion of the answer.
+        #
+        # IMPORTANT:
+        #
+        # We do NOT run NLI again after repair.
+        #
+        # GroundingValidator has already classified the
+        # claims. AnswerRepairer removes fragments mapped
+        # to unsupported claims.
+        #
+        # We DO rerun deterministic citation validation
+        # because removing text may also remove citations.
+        # =================================================
+
+        if (
+            not insufficient
+            and citation_passed
+            and grounding_result is not None
+            and not grounding_result.passed
+        ):
+
+            repair_start = (
+                time.perf_counter()
+            )
+
+            repair_result = (
+                self.answer_repairer.repair(
+                    answer=(
+                        candidate_answer
+                    ),
+
+                    grounding_result=(
+                        grounding_result
+                    ),
+                )
+            )
+
+            repair_state = {
+                "attempted": True,
+
+                "changed": bool(
+                    repair_result.get(
+                        "changed",
+                        False,
+                    )
+                ),
+
+                "usable": bool(
+                    repair_result.get(
+                        "usable",
+                        False,
+                    )
+                ),
+
+                "supported_claims": (
+                    repair_result.get(
+                        "supported_claims",
+                        0,
+                    )
+                ),
+
+                "unsupported_claims": (
+                    repair_result.get(
+                        "unsupported_claims",
+                        0,
+                    )
+                ),
+
+                "removed_fragments": (
+                    repair_result.get(
+                        "removed_fragments",
+                        [],
+                    )
+                ),
+            }
+
+            repaired_answer = (
+                repair_result.get(
+                    "repaired_answer",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            # ---------------------------------------------
+            # Use repair only when:
+            #
+            # 1. Something actually changed.
+            # 2. Supported content remains.
+            # 3. The repaired answer is non-empty.
+            # ---------------------------------------------
+
+            if (
+                repair_state[
+                    "changed"
+                ]
+                and repair_state[
+                    "usable"
+                ]
+                and repaired_answer
+            ):
+
+                validation_start = (
+                    time.perf_counter()
+                )
+
+                repaired_validation = (
+                    self.answer_validator.validate(
+                        answer=(
+                            repaired_answer
+                        ),
+
+                        evidence=(
+                            evidence
+                        ),
+                    )
+                )
+
+                performance[
+                    "repair_citation_validation_seconds"
+                ] = self._elapsed(
+                    validation_start
+                )
+
+                repaired_citation_passed = bool(
+                    repaired_validation.get(
+                        "validation_passed",
+                        False,
+                    )
+                )
+
+                repaired_insufficient = bool(
+                    repaired_validation.get(
+                        "insufficient_evidence",
+                        False,
+                    )
+                )
+
+                # Repair should not transform a factual
+                # answer into an insufficient-evidence
+                # response.
+
+                if (
+                    repaired_citation_passed
+                    and not repaired_insufficient
+                ):
+
+                    candidate_answer = (
+                        repaired_answer
+                    )
+
+                    citation_validation = (
+                        repaired_validation
+                    )
+
+                    citation_passed = True
+
+                    repair_state[
+                        "accepted"
+                    ] = True
+
+                else:
+
+                    repair_state[
+                        "accepted"
+                    ] = False
+
+                    repair_state[
+                        "revalidation_errors"
+                    ] = (
+                        repaired_validation.get(
+                            "errors",
+                            [],
+                        )
+                    )
+
+            else:
+
+                repair_state[
+                    "accepted"
+                ] = False
+
+            performance[
+                "repair_seconds"
+            ] = self._elapsed(
+                repair_start
+            )
+
+        # =================================================
+        # STEP 8
+        # ACCEPTANCE GATE
+        # =================================================
+
+        failure_reasons = []
+
+        if insufficient:
+
+            accepted = (
+                citation_passed
+            )
+
+            grounded = False
+
+            if not citation_passed:
+
+                failure_reasons.append(
+                    "Insufficient-evidence response "
+                    "failed deterministic answer "
+                    "validation."
+                )
+
+        else:
+
+            grounding_passed = bool(
+                grounding_result
+                and grounding_result.passed
+            )
+
+            repair_accepted = bool(
+                repair_state.get(
+                    "accepted",
+                    False,
+                )
+            )
+
+            # ---------------------------------------------
+            # Normal acceptance:
+            #
+            # Citation validation
+            # +
+            # complete NLI grounding
+            #
+            # OR
+            #
+            # Citation validation
+            # +
+            # successful removal of unsupported claims
+            # ---------------------------------------------
+
+            accepted = (
+                citation_passed
+                and (
+                    grounding_passed
+                    or repair_accepted
+                )
+            )
+
+            grounded = (
+                accepted
+            )
+
+            if not citation_passed:
+
+                failure_reasons.append(
+                    "Citation validation failed."
+                )
+
+            if (
+                not grounding_passed
+                and not repair_accepted
+            ):
+
+                failure_reasons.append(
+                    "One or more generated claims were "
+                    "not supported by their cited "
+                    "evidence and could not be safely "
+                    "removed."
+                )
+
+        # =================================================
+        # STEP 9
+        # USER-FACING ANSWER
+        # =================================================
+
+        if accepted:
+
+            final_answer = (
+                candidate_answer
+            )
+
+        else:
+
+            final_answer = (
+                self.SAFE_FAILURE_MESSAGE
+            )
+
+        # =================================================
+        # STEP 10
+        # SOURCES
+        # =================================================
+
+        if accepted:
+
+            sources = (
+                self._build_sources(
+                    citation_validation
+                )
+            )
+
+        else:
+
+            sources = []
+
+        # =================================================
+        # STEP 11
+        # RETRIEVAL STATS
+        # =================================================
+
+        retrieval_stats = dict(
+            retrieval.get(
+                "stats",
+                {},
+            )
+        )
+
+        retrieval_stats[
+            "hybrid_candidates"
+        ] = len(
+            hybrid_candidates
+        )
+
+        retrieval_stats[
+            "reranked_candidates"
+        ] = len(
+            reranked_candidates
+        )
+
+        retrieval_stats[
+            "relevance_status"
+        ] = (
+            relevance_decision.status
+        )
+
+        retrieval_stats[
+            "relevance_allow_generation"
+        ] = (
+            relevance_decision.allow_generation
+        )
+
+        # =================================================
+        # STEP 11A
+        # FINAL PERFORMANCE METRICS
+        # =================================================
+
+        performance[
+            "total_seconds"
+        ] = self._elapsed(
+            pipeline_start
+        )
+
+        measured_stages = (
+            performance[
+                "retrieval_seconds"
+            ]
+            + performance[
+                "reranking_seconds"
+            ]
+            + performance[
+                "relevance_gate_seconds"
+            ]
+            + performance[
+                "context_building_seconds"
+            ]
+            + performance[
+                "generation_seconds"
+            ]
+            + performance[
+                "citation_validation_seconds"
+            ]
+            + performance[
+                "nli_grounding_seconds"
+            ]
+            + performance[
+                "repair_seconds"
+            ]
+        )
+
+        performance[
+            "pipeline_processing_seconds"
+        ] = round(
+            measured_stages,
+            4,
+        )
+
+        # =================================================
+        # STEP 12
+        # RETURN
+        # =================================================
+
+        return QAResult(
+            query=query,
+
+            answer=(
+                final_answer
+            ),
+
+            accepted=(
+                accepted
+            ),
+
+            grounded=(
+                grounded
+            ),
+
+            insufficient_evidence=(
+                insufficient
+            ),
+
+            sources=(
+                sources
+            ),
+
+            citation_validation=(
+                citation_validation
+            ),
+
+            grounding_validation=(
+                grounding_summary
+            ),
+
+            retrieval_stats=(
+                retrieval_stats
+            ),
+
+            context_stats=(
+                context_result.get(
+                    "stats",
+                    {},
+                )
+            ),
+
+            failure_reasons=(
+                failure_reasons
+            ),
+
+            repair=(
+                repair_state
+            ),
+
+            relevance=(
+                relevance_summary
+            ),
+
+            performance=(
+                performance
+            ),
+        )
+
+    def close(
+        self,
+    ) -> None:
+        """
+        Release resources owned by the pipeline.
+        """
+
+        self.retriever.close()

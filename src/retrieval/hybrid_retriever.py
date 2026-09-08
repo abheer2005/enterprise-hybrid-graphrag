@@ -1,0 +1,603 @@
+import hashlib
+from pathlib import Path
+from typing import Any
+from src.retrieval.vector_store import VectorStore
+from src.retrieval.graph_retriever import GraphRetriever
+from src.config.retrieval_config import RetrievalConfig
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+VECTOR_DIR = (
+    PROJECT_ROOT
+    / "data"
+    / "processed"
+    / "vector"
+)
+
+DEFAULT_INDEX_FILE = (
+    VECTOR_DIR
+    / "chunks.faiss"
+)
+
+DEFAULT_METADATA_FILE = (
+    VECTOR_DIR
+    / "metadata.json"
+)
+
+
+class HybridRetriever:
+    """
+    Hybrid retrieval layer for IOCL GraphRAG.
+
+    Combines:
+        1. Semantic vector retrieval
+        2. Semantic knowledge-graph retrieval
+        3. Graph provenance chunks
+        4. Chunk-level candidate fusion
+
+    Important:
+        - No document names are hard-coded.
+        - No departments are hard-coded.
+        - No business domains are hard-coded.
+        - No manual assistant/model routing is used.
+
+    The retriever works over the indexed corpus and lets
+    semantic retrieval determine relevant information.
+    """
+
+    def __init__(
+        self,
+        vector_store: VectorStore | None = None,
+        graph_retriever: GraphRetriever | None = None,
+        index_path: Path = DEFAULT_INDEX_FILE,
+        metadata_path: Path = DEFAULT_METADATA_FILE,
+    ):
+        self._owns_vector_store = (
+            vector_store is None
+        )
+
+        self._owns_graph_retriever = (
+            graph_retriever is None
+        )
+
+        # -------------------------------------------------
+        # VECTOR STORE
+        # -------------------------------------------------
+
+        if vector_store is None:
+
+            self.vector_store = VectorStore()
+
+            self.vector_store.load(
+                index_path,
+                metadata_path,
+            )
+
+        else:
+
+            self.vector_store = vector_store
+
+        # -------------------------------------------------
+        # GRAPH RETRIEVER
+        # -------------------------------------------------
+        #
+        # Reuse the SAME embedding model already loaded
+        # by the vector store.
+        #
+        # This avoids loading another SentenceTransformer
+        # model and allows GraphRetriever's semantic entity
+        # linker to use the same embedding space.
+        # -------------------------------------------------
+
+        if graph_retriever is None:
+
+            self.graph_retriever = GraphRetriever(
+                embedding_model=self.vector_store.model,
+            )
+
+        else:
+
+            self.graph_retriever = graph_retriever
+
+    @staticmethod
+    def _graph_chunk_to_candidate(
+        chunk: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Convert a Neo4j provenance chunk into the same
+        basic structure used by vector candidates.
+        """
+
+        metadata = {
+            "source": chunk.get("source"),
+            "page": chunk.get("page"),
+        }
+
+        return {
+            "chunk_id": chunk.get("chunk_id"),
+            "text": chunk.get("text", ""),
+            "metadata": metadata,
+        }
+
+    def retrieve(
+        self,
+        query: str,
+        vector_top_k=RetrievalConfig.VECTOR_TOP_K,
+        entity_limit=RetrievalConfig.GRAPH_ENTITY_LIMIT,
+        relation_limit=RetrievalConfig.GRAPH_RELATION_LIMIT,
+        final_top_k=RetrievalConfig.FINAL_CONTEXT_K,
+        semantic_min_score: float = 0.25,
+    ) -> dict[str, Any]:
+        """
+        Retrieve evidence independently through the vector
+        and graph paths and fuse the results at chunk level.
+
+        Flow:
+
+            User query
+                |
+                +----> Vector retrieval
+                |
+                +----> Semantic graph retrieval
+                            |
+                            +--> entity linking
+                            +--> relationships
+                            +--> provenance chunks
+                |
+                v
+            Candidate fusion
+                |
+                v
+            Hybrid scoring
+                |
+                v
+            Ranked evidence candidates
+
+        This is still retrieval/fusion.
+
+        A stronger reranking layer and grounded answer
+        generation can be added after this stage.
+        """
+
+        # -------------------------------------------------
+        # 1. VECTOR RETRIEVAL
+        # -------------------------------------------------
+
+        print("\n" + "=" * 80)
+        print(f"VECTOR_TOP_K RECEIVED = {vector_top_k}")
+        print("=" * 80)
+
+        vector_results = self.vector_store.search(
+            query=query,
+            top_k=vector_top_k,
+        )
+
+        print("\n" + "=" * 80)
+        print("VECTOR RETRIEVAL")
+
+        for i, r in enumerate(vector_results, 1):
+            meta = r.get("metadata", {})
+            print(
+                f"{i}. "
+                f"{meta.get('source')} | "
+                f"Page {meta.get('page')} | "
+                f"Score={r.get('score',0):.3f}"
+            )
+
+        # -------------------------------------------------
+        # 2. GRAPH RETRIEVAL
+        # -------------------------------------------------
+
+        graph_result = self.graph_retriever.retrieve(
+            query=query,
+            entity_limit=entity_limit,
+            relation_limit=relation_limit,
+            semantic_min_score=semantic_min_score,
+        )
+
+        graph_chunks = graph_result.get(
+            "chunks",
+            [],
+        )
+
+        relationships = graph_result.get(
+            "relationships",
+            [],
+        )
+
+        print("\nGRAPH RETRIEVAL")
+
+        for i, c in enumerate(graph_chunks, 1):
+            print(
+                f"{i}. "
+                f"{c.get('source')} | "
+                f"Page {c.get('page')}"
+            )
+
+        # -------------------------------------------------
+        # 3. COUNT GRAPH RELATIONSHIPS PER CHUNK
+        # -------------------------------------------------
+
+        graph_relation_counts: dict[str, int] = {}
+
+        for relationship in relationships:
+
+            chunk_id = relationship.get(
+                "chunk_id"
+            )
+
+            if not chunk_id:
+                continue
+
+            graph_relation_counts[chunk_id] = (
+                graph_relation_counts.get(
+                    chunk_id,
+                    0,
+                )
+                + 1
+            )
+
+        # -------------------------------------------------
+        # 4. BUILD CANDIDATE MAP
+        # -------------------------------------------------
+
+        candidates: dict[
+            str,
+            dict[str, Any],
+        ] = {}
+
+        # -------------------------------------------------
+        # 4A. ADD VECTOR CANDIDATES
+        # -------------------------------------------------
+
+        for rank, result in enumerate(
+            vector_results,
+            start=1,
+        ):
+
+            chunk_id = result.get(
+                "chunk_id"
+            )
+
+            if not chunk_id:
+                continue
+
+            candidates[chunk_id] = {
+                "chunk_id": chunk_id,
+                "text": result.get(
+                    "text",
+                    "",
+                ),
+                "metadata": result.get(
+                    "metadata",
+                    {},
+                ),
+                "vector_score": result.get(
+                    "score"
+                ),
+                "vector_rank": rank,
+                "graph_match": False,
+                "graph_relation_count": 0,
+                "retrieval_sources": [
+                    "vector"
+                ],
+            }
+
+        # -------------------------------------------------
+        # 4B. MERGE GRAPH PROVENANCE CANDIDATES
+        # -------------------------------------------------
+
+        for graph_rank, chunk in enumerate(graph_chunks, start=1):
+
+            normalized = (
+                self._graph_chunk_to_candidate(
+                    chunk
+                )
+            )
+
+            chunk_id = normalized.get(
+                "chunk_id"
+            )
+
+            if not chunk_id:
+                continue
+
+            relation_count = (
+                graph_relation_counts.get(
+                    chunk_id,
+                    0,
+                )
+            )
+
+            # ---------------------------------------------
+            # Candidate already found by vector retrieval.
+            # Add graph evidence to it.
+            # ---------------------------------------------
+
+            if chunk_id in candidates:
+
+                candidate = candidates[
+                    chunk_id
+                ]
+
+                candidate[
+                    "graph_match"
+                ] = True
+
+                candidate[
+                    "graph_relation_count"
+                ] = relation_count
+                candidate["graph_rank"] = min(
+                    graph_rank,
+                    candidate.get("graph_rank") or graph_rank,
+                )
+
+                if (
+                    "graph"
+                    not in candidate[
+                        "retrieval_sources"
+                    ]
+                ):
+
+                    candidate[
+                        "retrieval_sources"
+                    ].append(
+                        "graph"
+                    )
+
+            # ---------------------------------------------
+            # Graph-only candidate.
+            # ---------------------------------------------
+
+            else:
+
+                candidates[chunk_id] = {
+                    "chunk_id": chunk_id,
+                    "text": normalized.get(
+                        "text",
+                        "",
+                    ),
+                    "metadata": normalized.get(
+                        "metadata",
+                        {},
+                    ),
+                    "vector_score": None,
+                    "vector_rank": None,
+                    "graph_match": True,
+                    "graph_relation_count": (
+                        relation_count
+                    ),
+                    "graph_rank": graph_rank,
+                    "retrieval_sources": [
+                        "graph"
+                    ],
+                }
+
+        # -------------------------------------------------
+        # 5. HYBRID SCORING
+        # -------------------------------------------------
+        #
+        # This is intentionally a transparent baseline.
+        #
+        # VECTOR:
+        # Semantic similarity score.
+        #
+        # GRAPH:
+        # Bounded bonus based on graph relationships
+        # supported by the provenance chunk.
+        #
+        # OVERLAP:
+        # Extra evidence when vector and graph retrieval
+        # independently retrieve the same chunk.
+        #
+        # This is NOT intended to be the final enterprise
+        # reranking mechanism.
+        # -------------------------------------------------
+
+        fused_results = []
+
+        for candidate in candidates.values():
+
+            vector_score = candidate.get(
+                "vector_score"
+            )
+
+            if vector_score is not None:
+
+                vector_component = float(
+                    vector_score
+                )
+
+            else:
+
+                vector_component = 0.0
+
+            relation_count = candidate.get(
+                "graph_relation_count",
+                0,
+            )
+
+            # Relation count alone is not relevance. Graph expansion remains
+            # subordinate to semantic evidence unless both paths agree.
+            graph_component = (
+                min(0.08, 0.04 + min(relation_count, 4) * 0.01)
+                if candidate.get("graph_rank") is not None else 0.0
+            )
+
+            retrieval_sources = candidate.get(
+                "retrieval_sources",
+                [],
+            )
+
+            appears_in_both = (
+                "vector" in retrieval_sources
+                and
+                "graph" in retrieval_sources
+            )
+
+            if appears_in_both:
+
+                overlap_bonus = 0.04
+
+            else:
+
+                overlap_bonus = 0.0
+
+            hybrid_score = (
+                vector_component
+                + graph_component
+                + overlap_bonus
+            )
+
+            candidate[
+                "hybrid_score"
+            ] = hybrid_score
+
+            fused_results.append(
+                candidate
+            )
+
+        # Repeated headers and duplicate page extractions must not consume
+        # expensive cross-encoder and grounding capacity.
+        deduplicated: dict[str, dict[str, Any]] = {}
+        for candidate in fused_results:
+            normalized_text = " ".join(candidate.get("text", "").split()).casefold()
+            key = hashlib.sha256(normalized_text.encode("utf-8")).hexdigest()
+            current = deduplicated.get(key)
+            if current is None:
+                deduplicated[key] = candidate
+                continue
+
+            # Keep the strongest representative while unioning provenance from
+            # every identical copy. Otherwise deduplication can accidentally
+            # turn a vector+graph agreement into a vector-only candidate.
+            representative = (
+                candidate
+                if candidate["hybrid_score"] > current["hybrid_score"]
+                else current
+            )
+            sources = set(current.get("retrieval_sources", []))
+            sources.update(candidate.get("retrieval_sources", []))
+            representative["retrieval_sources"] = sorted(sources)
+            representative["graph_match"] = "graph" in sources
+            representative["graph_relation_count"] = max(
+                int(current.get("graph_relation_count", 0) or 0),
+                int(candidate.get("graph_relation_count", 0) or 0),
+            )
+            graph_ranks = [
+                rank for rank in (current.get("graph_rank"), candidate.get("graph_rank"))
+                if rank is not None
+            ]
+            representative["graph_rank"] = min(graph_ranks) if graph_ranks else None
+            vector_score = float(representative.get("vector_score") or 0.0)
+            graph_component = (
+                min(
+                    0.08,
+                    0.04 + min(representative["graph_relation_count"], 4) * 0.01,
+                )
+                if representative["graph_match"] else 0.0
+            )
+            overlap_bonus = 0.04 if {"vector", "graph"}.issubset(sources) else 0.0
+            representative["hybrid_score"] = (
+                vector_score + graph_component + overlap_bonus
+            )
+            deduplicated[key] = representative
+        fused_results = list(deduplicated.values())
+
+        # -------------------------------------------------
+        # 6. SORT CANDIDATES
+        # -------------------------------------------------
+
+        fused_results.sort(
+            key=lambda item: (
+                item.get(
+                    "hybrid_score",
+                    0.0,
+                ),
+                item.get(
+                    "vector_score"
+                )
+                or 0.0,
+                item.get(
+                    "graph_relation_count",
+                    0,
+                ),
+            ),
+            reverse=True,
+        )
+
+        # -------------------------------------------------
+        # 7. RETURN FUSED RETRIEVAL CANDIDATES
+        # -------------------------------------------------
+        #
+        # HybridRetriever stops at retrieval + fusion.
+        # Query-aware cross-encoder reranking, relevance
+        # gating, and final evidence selection are handled
+        # downstream by the QA pipeline.
+        #
+        # Keeping those stages out of this class avoids
+        # reranking/selecting the evidence twice and avoids
+        # throwing away useful candidates too early.
+        # -------------------------------------------------
+
+        final_results = fused_results[:final_top_k]
+
+        print("\nHYBRID CANDIDATES")
+
+        for i, c in enumerate(final_results, 1):
+            meta = c.get("metadata", {})
+            print(
+                f"{i}. "
+                f"{meta.get('source')} | "
+                f"Page {meta.get('page')} | "
+                f"Hybrid={c.get('hybrid_score', 0):.3f}"
+            )
+
+        print("=" * 80)
+
+
+        # -------------------------------------------------
+        # 8. RETURN TRANSPARENT RETRIEVAL STATE
+        # -------------------------------------------------
+
+        return {
+            "query": query,
+
+            "vector_results": (
+                vector_results
+            ),
+
+            "graph": (
+                graph_result
+            ),
+
+            "candidates": (
+                final_results
+            ),
+
+            "stats": {
+                "vector_candidates": len(
+                    vector_results
+                ),
+                "graph_chunks": len(
+                    graph_chunks
+                ),
+                "unique_candidates": len(
+                    candidates
+                ),
+                "returned_candidates": len(
+                    final_results
+                ),
+            },
+        }
+
+    def close(
+        self,
+    ):
+        """
+        Close resources owned by this retriever.
+        """
+
+        if self._owns_graph_retriever:
+
+            self.graph_retriever.close()

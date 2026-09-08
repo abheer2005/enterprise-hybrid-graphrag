@@ -1,0 +1,294 @@
+import json
+from pathlib import Path
+from typing import Any
+
+
+import numpy as np
+from sentence_transformers import SentenceTransformer
+
+
+DEFAULT_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+
+
+class VectorStore:
+    def __init__(self, model_name: str = DEFAULT_MODEL):
+        print(f"Loading embedding model: {model_name}")
+
+        self.model_name = model_name
+        self.model = SentenceTransformer(model_name)
+
+        import faiss
+
+        self.faiss = faiss
+
+        self.index = None
+        self.records: list[dict[str, Any]] = []
+        self._provenance_index: dict[tuple[str, int], list[dict[str, Any]]] = {}
+
+    def _rebuild_provenance_index(self) -> None:
+        index: dict[tuple[str, int], list[dict[str, Any]]] = {}
+        for record in self.records:
+            metadata = record.get("metadata", {})
+            source = metadata.get("source")
+            page = metadata.get("page")
+            if source and isinstance(page, int):
+                index.setdefault((source, page), []).append(record)
+        self._provenance_index = index
+
+    def adjacent_records(
+        self,
+        source: str,
+        page: int,
+        radius: int = 1,
+    ) -> list[dict[str, Any]]:
+        """Return neighboring page chunks using an O(1) provenance lookup."""
+        output = []
+        # Forward pages commonly contain the operative rule following a
+        # definition/background page, so inspect them before prior pages.
+        neighbor_pages = list(range(page + 1, page + radius + 1))
+        neighbor_pages.extend(range(page - 1, max(0, page - radius - 1), -1))
+        for neighbor_page in neighbor_pages:
+            output.extend(self._provenance_index.get((source, neighbor_page), []))
+        return output
+
+    def load_chunks(self, chunks_path: Path) -> list[dict[str, Any]]:
+        records = []
+
+        with chunks_path.open("r", encoding="utf-8") as file:
+            for line in file:
+                line = line.strip()
+
+                if line:
+                    records.append(json.loads(line))
+
+        return records
+
+    def build(self, chunks_path: Path) -> None:
+        self.records = self.load_chunks(chunks_path)
+
+        if not self.records:
+            raise ValueError("No chunks found.")
+
+        texts = [record["text"] for record in self.records]
+
+        print(f"Creating embeddings for {len(texts)} chunks...")
+
+        embeddings = self.model.encode(
+            texts,
+            batch_size=32,
+            show_progress_bar=True,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+        )
+
+        embeddings = np.asarray(
+            embeddings,
+            dtype="float32",
+        )
+
+        dimension = embeddings.shape[1]
+
+        print(f"Embedding dimension: {dimension}")
+
+        # Inner product over normalized embeddings = cosine similarity
+        self.index = self.faiss.IndexFlatIP(dimension)
+
+        self.index.add(embeddings)
+        self._rebuild_provenance_index()
+
+        print(
+            f"FAISS index contains "
+            f"{self.index.ntotal} vectors."
+        )
+
+    def build_incremental(
+        self,
+        chunks_path: Path,
+        index_path: Path,
+        metadata_path: Path,
+    ) -> None:
+        """Reuse unchanged vectors and encode only new or changed chunks."""
+        incoming = self.load_chunks(chunks_path)
+        if not index_path.exists() or not metadata_path.exists():
+            self.build(chunks_path)
+            return
+
+        old_index = self.faiss.read_index(str(index_path))
+        with metadata_path.open("r", encoding="utf-8") as stream:
+            old_payload = json.load(stream)
+        if old_payload.get("model_name") != self.model_name:
+            self.build(chunks_path)
+            return
+
+        old_records = old_payload.get("records", [])
+        old_positions = {record["chunk_id"]: index for index, record in enumerate(old_records)}
+        dimension = old_index.d
+        vectors = np.empty((len(incoming), dimension), dtype="float32")
+        missing_positions = []
+        missing_texts = []
+        for position, record in enumerate(incoming):
+            old_position = old_positions.get(record["chunk_id"])
+            if old_position is None:
+                missing_positions.append(position)
+                missing_texts.append(record["text"])
+            else:
+                vectors[position] = old_index.reconstruct(old_position)
+
+        if missing_texts:
+            encoded = self.model.encode(
+                missing_texts,
+                batch_size=32,
+                show_progress_bar=True,
+                convert_to_numpy=True,
+                normalize_embeddings=True,
+            )
+            for position, vector in zip(missing_positions, encoded):
+                vectors[position] = vector
+
+        self.records = incoming
+        self.index = self.faiss.IndexFlatIP(dimension)
+        self.index.add(np.asarray(vectors, dtype="float32"))
+        self._rebuild_provenance_index()
+        print(
+            f"Reused {len(incoming) - len(missing_texts)} vectors; "
+            f"encoded {len(missing_texts)} new/changed chunks."
+        )
+
+    def save(
+        self,
+        index_path: Path,
+        metadata_path: Path,
+    ) -> None:
+
+        if self.index is None:
+            raise ValueError("Vector index has not been built.")
+
+        index_path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        self.faiss.write_index(
+            self.index,
+            str(index_path),
+        )
+
+        with metadata_path.open(
+            "w",
+            encoding="utf-8",
+        ) as file:
+            json.dump(
+                {
+                    "model_name": self.model_name,
+                    "records": self.records,
+                },
+                file,
+                ensure_ascii=False,
+            )
+
+        print(f"Saved FAISS index: {index_path}")
+        print(f"Saved metadata:    {metadata_path}")
+
+    def load(
+        self,
+        index_path: Path,
+        metadata_path: Path,
+    ) -> None:
+
+        self.index = self.faiss.read_index(
+            str(index_path)
+        )
+
+        with metadata_path.open(
+            "r",
+            encoding="utf-8",
+        ) as file:
+            payload = json.load(file)
+
+        self.records = payload["records"]
+        self._rebuild_provenance_index()
+
+        print(
+            f"Loaded {self.index.ntotal} vectors "
+            f"and {len(self.records)} records."
+        )
+
+
+    def debug_page(self, source: str, page: int):
+        print("\n" + "=" * 80)
+        print(f"DEBUG: {source} | Page {page}")
+
+        found = False
+
+        for record in self.records:
+            meta = record["metadata"]
+
+            if (
+                meta.get("source") == source
+                and meta.get("page") == page
+            ):
+                found = True
+                print("-" * 80)
+                print(f"Chunk ID : {record['chunk_id']}")
+                print(record["text"][:1000])
+
+        if not found:
+            print("No chunks found!")
+
+        print("=" * 80)
+
+
+    def search(
+        self,
+        query: str,
+        top_k: int = 5,
+        include_inactive: bool = False,
+    ) -> list[dict[str, Any]]:
+
+        if self.index is None:
+            raise ValueError("Vector index is not loaded.")
+
+        query_embedding = self.model.encode(
+            [query],
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+        )
+
+        query_embedding = np.asarray(
+            query_embedding,
+            dtype="float32",
+        )
+
+        candidate_k = min(self.index.ntotal, max(top_k, top_k * 3))
+        scores, indices = self.index.search(
+            query_embedding,
+            candidate_k,
+        )
+
+        results = []
+
+        for score, index in zip(
+            scores[0],
+            indices[0],
+        ):
+            if index < 0:
+                continue
+
+            record = self.records[index]
+            status = str(record.get("metadata", {}).get("status", "current")).casefold()
+            if not include_inactive and status in {"obsolete", "superseded", "revoked", "expired"}:
+                continue
+
+            results.append(
+                {
+                    "score": float(score),
+                    "chunk_id": record["chunk_id"],
+                    "text": record["text"],
+                    "metadata": record["metadata"],
+                }
+            )
+
+            if len(results) >= top_k:
+                break
+
+        return results

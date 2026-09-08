@@ -1,0 +1,729 @@
+from dataclasses import dataclass
+from typing import Any
+
+
+@dataclass
+class RelevanceDecision:
+    """
+    Result produced by the retrieval relevance gate.
+
+    status:
+        "relevant"
+        "borderline"
+        "irrelevant"
+
+    allow_generation:
+        True  -> continue to ContextBuilder + LLM
+        False -> stop before LLM
+    """
+
+    status: str
+    allow_generation: bool
+
+    top_semantic_score: float
+    mean_top_semantic_score: float
+
+    top_rerank_score: float
+    mean_top_rerank_score: float
+
+    strong_semantic_matches: int
+    moderate_semantic_matches: int
+
+    vector_graph_agreements: int
+
+    reason: str
+
+
+class RelevanceGate:
+    """
+    Conservative relevance gate for GraphRAG retrieval.
+
+    The gate is intentionally recall-oriented.
+
+    Its job is NOT to determine whether the retrieved evidence
+    fully answers the question. That responsibility belongs to
+    downstream grounded generation / validation.
+
+    Its job is only to stop queries when retrieval evidence is
+    clearly unrelated to the indexed corpus.
+
+    Signals used:
+
+        1. vector_score
+           Embedding similarity from vector retrieval.
+
+        2. rerank_score / cross_encoder_score
+           Query-document relevance produced by the
+           cross-encoder reranker.
+
+        3. retrieval_agreement
+           Whether vector and graph retrieval independently
+           found the same chunk.
+
+        4. graph_match
+           Weak supporting evidence only.
+
+    Important design rule:
+
+        A strong single chunk is sufficient to allow generation.
+
+    This matters for factual questions whose answer may occur
+    only once in the corpus.
+
+    No document names, departments, policies, topics, or
+    domain-specific keywords are hard-coded.
+    """
+
+    def __init__(
+        self,
+        strong_semantic_threshold: float = 0.50,
+        moderate_semantic_threshold: float = 0.32,
+        irrelevant_top_threshold: float = 0.18,
+        relevant_mean_threshold: float = 0.38,
+        strong_rerank_threshold: float = 0.50,
+        moderate_rerank_threshold: float = 0.20,
+        reject_rerank_threshold: float = 0.05,
+        top_n_for_mean: int = 3,
+    ):
+        self.strong_semantic_threshold = float(
+            strong_semantic_threshold
+        )
+
+        self.moderate_semantic_threshold = float(
+            moderate_semantic_threshold
+        )
+
+        self.irrelevant_top_threshold = float(
+            irrelevant_top_threshold
+        )
+
+        self.relevant_mean_threshold = float(
+            relevant_mean_threshold
+        )
+
+        self.strong_rerank_threshold = float(
+            strong_rerank_threshold
+        )
+
+        self.moderate_rerank_threshold = float(
+            moderate_rerank_threshold
+        )
+
+        self.reject_rerank_threshold = float(
+            reject_rerank_threshold
+        )
+
+        self.top_n_for_mean = max(
+            1,
+            int(top_n_for_mean),
+        )
+
+    # ---------------------------------------------------------
+    # SCORE HELPERS
+    # ---------------------------------------------------------
+
+    @staticmethod
+    def _score(
+        candidate: dict[str, Any],
+        key: str,
+    ) -> float:
+        """
+        Safely extract a numeric score.
+        """
+
+        value = candidate.get(key)
+
+        if value is None:
+            return 0.0
+
+        try:
+            return float(value)
+
+        except (TypeError, ValueError):
+            return 0.0
+
+    @classmethod
+    def _semantic_score(
+        cls,
+        candidate: dict[str, Any],
+    ) -> float:
+        """
+        Return the first-stage embedding similarity.
+
+        In the current pipeline HybridRetriever stores the
+        vector-store semantic similarity as:
+
+            vector_score
+
+        Older reranker versions used:
+
+            semantic_rerank_score
+
+        vector_score is therefore the primary field, while
+        semantic_rerank_score is retained only as a backwards-
+        compatibility fallback.
+        """
+
+        vector_score = candidate.get(
+            "vector_score"
+        )
+
+        if vector_score is not None:
+
+            try:
+                return float(vector_score)
+
+            except (TypeError, ValueError):
+                pass
+
+        return cls._score(
+            candidate,
+            "semantic_rerank_score",
+        )
+
+    @classmethod
+    def _rerank_score(
+        cls,
+        candidate: dict[str, Any],
+    ) -> float:
+        """
+        Return cross-encoder relevance.
+
+        Current HybridReranker writes the normalized
+        cross-encoder score into both:
+
+            cross_encoder_score
+            rerank_score
+
+        Prefer cross_encoder_score when available and fall
+        back to rerank_score for pipeline compatibility.
+        """
+
+        cross_encoder_score = candidate.get(
+            "cross_encoder_score"
+        )
+
+        if cross_encoder_score is not None:
+
+            try:
+                return float(
+                    cross_encoder_score
+                )
+
+            except (TypeError, ValueError):
+                pass
+
+        return cls._score(
+            candidate,
+            "rerank_score",
+        )
+
+    @staticmethod
+    def _agreement(
+        candidate: dict[str, Any],
+    ) -> bool:
+        """
+        Determine whether vector and graph retrieval agree.
+
+        Prefer the explicit field generated by the reranker,
+        but derive it from retrieval_sources when necessary.
+        """
+
+        explicit = candidate.get(
+            "retrieval_agreement"
+        )
+
+        if explicit is not None:
+            return bool(explicit)
+
+        retrieval_sources = (
+            candidate.get(
+                "retrieval_sources",
+                [],
+            )
+            or []
+        )
+
+        return (
+            "vector" in retrieval_sources
+            and
+            "graph" in retrieval_sources
+        )
+
+    # ---------------------------------------------------------
+    # MAIN EVALUATION
+    # ---------------------------------------------------------
+
+    def evaluate(
+        self,
+        candidates: list[dict[str, Any]],
+    ) -> RelevanceDecision:
+        """
+        Classify retrieval as:
+
+            relevant
+            borderline
+            irrelevant
+
+        Borderline retrieval is intentionally allowed.
+
+        The gate rejects only retrieval that is clearly weak
+        across BOTH semantic retrieval and cross-encoder
+        relevance.
+        """
+
+        # -----------------------------------------------------
+        # 0. NO CANDIDATES
+        # -----------------------------------------------------
+
+        if not candidates:
+
+            return RelevanceDecision(
+                status="irrelevant",
+                allow_generation=False,
+
+                top_semantic_score=0.0,
+                mean_top_semantic_score=0.0,
+
+                top_rerank_score=0.0,
+                mean_top_rerank_score=0.0,
+
+                strong_semantic_matches=0,
+                moderate_semantic_matches=0,
+
+                vector_graph_agreements=0,
+
+                reason=(
+                    "Retrieval returned no candidate "
+                    "document chunks."
+                ),
+            )
+
+        # -----------------------------------------------------
+        # 1. EXTRACT SIGNALS
+        # -----------------------------------------------------
+
+        semantic_scores = [
+            self._semantic_score(candidate)
+            for candidate in candidates
+        ]
+
+        rerank_scores = [
+            self._rerank_score(candidate)
+            for candidate in candidates
+        ]
+
+        # Do NOT assume the incoming list is ordered by vector
+        # similarity. It is normally ordered by cross-encoder
+        # relevance after reranking.
+
+        semantic_scores_sorted = sorted(
+            semantic_scores,
+            reverse=True,
+        )
+
+        rerank_scores_sorted = sorted(
+            rerank_scores,
+            reverse=True,
+        )
+
+        top_semantic_score = (
+            semantic_scores_sorted[0]
+            if semantic_scores_sorted
+            else 0.0
+        )
+
+        top_rerank_score = (
+            rerank_scores_sorted[0]
+            if rerank_scores_sorted
+            else 0.0
+        )
+
+        # -----------------------------------------------------
+        # 2. TOP-N MEANS
+        # -----------------------------------------------------
+
+        semantic_top_n = (
+            semantic_scores_sorted[
+                :self.top_n_for_mean
+            ]
+        )
+
+        rerank_top_n = (
+            rerank_scores_sorted[
+                :self.top_n_for_mean
+            ]
+        )
+
+        mean_top_semantic_score = (
+            sum(semantic_top_n)
+            / len(semantic_top_n)
+            if semantic_top_n
+            else 0.0
+        )
+
+        mean_top_rerank_score = (
+            sum(rerank_top_n)
+            / len(rerank_top_n)
+            if rerank_top_n
+            else 0.0
+        )
+
+        # -----------------------------------------------------
+        # 3. SEMANTIC MATCH COUNTS
+        # -----------------------------------------------------
+
+        strong_semantic_matches = sum(
+            score
+            >= self.strong_semantic_threshold
+            for score in semantic_scores
+        )
+
+        moderate_semantic_matches = sum(
+            score
+            >= self.moderate_semantic_threshold
+            for score in semantic_scores
+        )
+
+        # -----------------------------------------------------
+        # 4. RETRIEVAL AGREEMENT
+        # -----------------------------------------------------
+
+        vector_graph_agreements = sum(
+            1
+            for candidate in candidates
+            if self._agreement(candidate)
+        )
+
+        graph_matches = sum(
+            1
+            for candidate in candidates
+            if bool(
+                candidate.get(
+                    "graph_match",
+                    False,
+                )
+            )
+        )
+
+        # -----------------------------------------------------
+        # 5. DECISION SIGNALS
+        # -----------------------------------------------------
+
+        strong_single_semantic = (
+            top_semantic_score
+            >= self.strong_semantic_threshold
+        )
+
+        moderate_single_semantic = (
+            top_semantic_score
+            >= self.moderate_semantic_threshold
+        )
+
+        healthy_semantic_distribution = (
+            mean_top_semantic_score
+            >= self.relevant_mean_threshold
+        )
+
+        strong_cross_encoder = (
+            top_rerank_score
+            >= self.strong_rerank_threshold
+        )
+
+        moderate_cross_encoder = (
+            top_rerank_score
+            >= self.moderate_rerank_threshold
+        )
+
+        clearly_weak_semantic = (
+            top_semantic_score
+            < self.irrelevant_top_threshold
+        )
+
+        # -----------------------------------------------------
+        # 6. RELEVANT
+        # -----------------------------------------------------
+        #
+        # A strong embedding match is enough to continue.
+        #
+        # This protects questions where the relevant fact is
+        # contained in one highly relevant chunk.
+        # -----------------------------------------------------
+
+        if strong_single_semantic:
+
+            return RelevanceDecision(
+                status="relevant",
+                allow_generation=True,
+
+                top_semantic_score=(
+                    top_semantic_score
+                ),
+                mean_top_semantic_score=(
+                    mean_top_semantic_score
+                ),
+
+                top_rerank_score=(
+                    top_rerank_score
+                ),
+                mean_top_rerank_score=(
+                    mean_top_rerank_score
+                ),
+
+                strong_semantic_matches=(
+                    strong_semantic_matches
+                ),
+                moderate_semantic_matches=(
+                    moderate_semantic_matches
+                ),
+
+                vector_graph_agreements=(
+                    vector_graph_agreements
+                ),
+
+                reason=(
+                    "At least one retrieved chunk has "
+                    "strong semantic similarity to the "
+                    "query."
+                ),
+            )
+
+        # -----------------------------------------------------
+        # Strong cross-encoder evidence can independently
+        # establish relevance.
+        # -----------------------------------------------------
+
+        if strong_cross_encoder:
+
+            return RelevanceDecision(
+                status="relevant",
+                allow_generation=True,
+
+                top_semantic_score=(
+                    top_semantic_score
+                ),
+                mean_top_semantic_score=(
+                    mean_top_semantic_score
+                ),
+
+                top_rerank_score=(
+                    top_rerank_score
+                ),
+                mean_top_rerank_score=(
+                    mean_top_rerank_score
+                ),
+
+                strong_semantic_matches=(
+                    strong_semantic_matches
+                ),
+                moderate_semantic_matches=(
+                    moderate_semantic_matches
+                ),
+
+                vector_graph_agreements=(
+                    vector_graph_agreements
+                ),
+
+                reason=(
+                    "Cross-encoder reranking found a "
+                    "strong query-document match."
+                ),
+            )
+
+        # -----------------------------------------------------
+        # Several reasonably similar chunks are also strong
+        # corpus-level evidence.
+        # -----------------------------------------------------
+
+        if (
+            moderate_semantic_matches >= 2
+            and
+            healthy_semantic_distribution
+        ):
+
+            return RelevanceDecision(
+                status="relevant",
+                allow_generation=True,
+
+                top_semantic_score=(
+                    top_semantic_score
+                ),
+                mean_top_semantic_score=(
+                    mean_top_semantic_score
+                ),
+
+                top_rerank_score=(
+                    top_rerank_score
+                ),
+                mean_top_rerank_score=(
+                    mean_top_rerank_score
+                ),
+
+                strong_semantic_matches=(
+                    strong_semantic_matches
+                ),
+                moderate_semantic_matches=(
+                    moderate_semantic_matches
+                ),
+
+                vector_graph_agreements=(
+                    vector_graph_agreements
+                ),
+
+                reason=(
+                    "Multiple retrieved chunks show "
+                    "consistent semantic relevance."
+                ),
+            )
+
+        # -----------------------------------------------------
+        # 7. IRRELEVANT
+        # -----------------------------------------------------
+        #
+        # Reject only when BOTH principal semantic systems
+        # are weak.
+        #
+        # Graph matches alone must not rescue an unrelated
+        # query because broad entity matches can occur even
+        # when the user's question is unrelated.
+        # -----------------------------------------------------
+
+        cross_encoder_rejects_all = (
+            top_rerank_score < self.reject_rerank_threshold
+        )
+
+        # A zero-like cross-encoder result across every candidate is strong
+        # negative evidence. Do not spend an LLM call merely because an
+        # unrelated embedding happens to score slightly above the legacy
+        # vector-only cutoff.
+        if (
+            cross_encoder_rejects_all
+            and not moderate_single_semantic
+            and vector_graph_agreements == 0
+        ) or (
+            clearly_weak_semantic
+            and
+            not moderate_cross_encoder
+        ):
+
+            return RelevanceDecision(
+                status="irrelevant",
+                allow_generation=False,
+
+                top_semantic_score=(
+                    top_semantic_score
+                ),
+                mean_top_semantic_score=(
+                    mean_top_semantic_score
+                ),
+
+                top_rerank_score=(
+                    top_rerank_score
+                ),
+                mean_top_rerank_score=(
+                    mean_top_rerank_score
+                ),
+
+                strong_semantic_matches=(
+                    strong_semantic_matches
+                ),
+                moderate_semantic_matches=(
+                    moderate_semantic_matches
+                ),
+
+                vector_graph_agreements=(
+                    vector_graph_agreements
+                ),
+
+                reason=(
+                    "Both vector semantic similarity and "
+                    "cross-encoder relevance are too weak "
+                    "to support generation."
+                ),
+            )
+
+        # -----------------------------------------------------
+        # 8. BORDERLINE BUT ALLOWED
+        # -----------------------------------------------------
+        #
+        # Anything that is not clearly irrelevant continues.
+        #
+        # Downstream generation is evidence-only, so allowing
+        # ambiguous retrieval here preserves recall without
+        # authorizing unsupported facts.
+        # -----------------------------------------------------
+
+        supporting_signals = []
+
+        if moderate_single_semantic:
+            supporting_signals.append(
+                "moderate semantic similarity"
+            )
+
+        if moderate_cross_encoder:
+            supporting_signals.append(
+                "cross-encoder support"
+            )
+
+        if vector_graph_agreements > 0:
+            supporting_signals.append(
+                "vector/graph retrieval agreement"
+            )
+
+        if graph_matches > 0:
+            supporting_signals.append(
+                "graph provenance support"
+            )
+
+        if supporting_signals:
+
+            reason = (
+                "Retrieval is not strong enough for the "
+                "'relevant' classification, but it has "
+                "supporting evidence: "
+                + ", ".join(supporting_signals)
+                + ". Generation is allowed so downstream "
+                  "grounding can determine whether the "
+                  "evidence answers the question."
+            )
+
+        else:
+
+            reason = (
+                "Retrieval is uncertain but not weak enough "
+                "to classify as clearly irrelevant. "
+                "Generation is allowed conservatively and "
+                "must remain grounded in retrieved evidence."
+            )
+
+        return RelevanceDecision(
+            status="borderline",
+            allow_generation=True,
+
+            top_semantic_score=(
+                top_semantic_score
+            ),
+            mean_top_semantic_score=(
+                mean_top_semantic_score
+            ),
+
+            top_rerank_score=(
+                top_rerank_score
+            ),
+            mean_top_rerank_score=(
+                mean_top_rerank_score
+            ),
+
+            strong_semantic_matches=(
+                strong_semantic_matches
+            ),
+            moderate_semantic_matches=(
+                moderate_semantic_matches
+            ),
+
+            vector_graph_agreements=(
+                vector_graph_agreements
+            ),
+
+            reason=reason,
+        )

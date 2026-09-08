@@ -1,0 +1,21 @@
+src\api\app.py:8:from dotenv import load_dotenv
+src\api\app.py:21:load_dotenv()
+src\api\app.py:35:    value = os.getenv(name, "").strip()
+src\api\app.py:140:    api_key = get_required_env("GEMINI_API_KEY")
+src\api\app.py:142:    model_name = os.getenv(
+src\api\app.py:143:        "GEMINI_MODEL",
+src\api\app.py:144:        "gemini-3.6-flash",
+src\generation\answer_generator.py:124:        model_name: str = "gemini-3.6-flash",
+src\generation\qa_pipeline.py:128:        model_name: str = "gemini-3.6-flash",
+src\graph\entity_extractor.py:5:from dotenv import load_dotenv
+src\graph\entity_extractor.py:11:load_dotenv()
+src\graph\entity_extractor.py:78:        api_key = os.getenv("GEMINI_API_KEY")
+src\graph\entity_extractor.py:82:                "GEMINI_API_KEY is missing from .env"
+src\graph\entity_extractor.py:85:        self.model = os.getenv(
+src\graph\entity_extractor.py:86:            "GEMINI_MODEL",
+src\graph\neo4j_store.py:4:from dotenv import load_dotenv
+src\graph\neo4j_store.py:9:load_dotenv(PROJECT_ROOT / ".env")
+src\graph\neo4j_store.py:14:        uri = os.getenv("NEO4J_URI")
+src\graph\neo4j_store.py:15:        username = os.getenv("NEO4J_USERNAME")
+src\graph\neo4j_store.py:16:        password = os.getenv("NEO4J_PASSWORD")
+src\graph\neo4j_store.py:18:        self.database = os.getenv(

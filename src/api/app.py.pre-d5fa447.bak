@@ -1,0 +1,412 @@
+from contextlib import asynccontextmanager
+from dataclasses import asdict
+import logging
+import os
+from pathlib import Path
+import tempfile
+from fastapi.responses import FileResponse
+from typing import Any
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+from src.generation.qa_pipeline import QAPipeline
+from src.ingestion.chunker import chunk_documents
+from src.ingestion.document_loader import SUPPORTED_EXTENSIONS, load_document
+from src.ingestion.processor import prepare_chunks
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+pipeline: QAPipeline | None = None
+
+
+def get_required_env(name: str) -> str:
+    """
+    Read a required environment variable.
+
+    Raises a clear startup error if the value is missing.
+    """
+
+    value = os.getenv(name, "").strip()
+
+    if not value:
+        raise RuntimeError(
+            f"Required environment variable '{name}' is missing."
+        )
+
+    return value
+
+
+# ============================================================
+# REQUEST / RESPONSE MODELS
+# ============================================================
+
+class AskRequest(BaseModel):
+    """
+    Request body for POST /ask.
+    """
+
+    query: str = Field(
+        ...,
+        min_length=1,
+        max_length=2000,
+        description="Question to ask the IOCL GraphRAG assistant.",
+    )
+
+    vector_top_k: int = Field(
+        default=75,
+        ge=1,
+        le=100,
+    )
+
+    entity_limit: int = Field(
+        default=20,
+        ge=1,
+        le=50,
+    )
+
+    relation_limit: int = Field(
+        default=75,
+        ge=1,
+        le=100,
+    )
+
+    semantic_min_score: float = Field(
+        default=0.25,
+        ge=0.0,
+        le=1.0,
+    )
+
+    hybrid_top_k: int = Field(
+        default=30,
+        ge=1,
+        le=50,
+    )
+
+    rerank_top_k: int = Field(
+        default=30,
+        ge=1,
+        le=50,
+    )
+
+
+class AskResponse(BaseModel):
+    """
+    API representation of QAResult.
+    """
+
+    query: str
+    answer: str
+
+    accepted: bool
+    grounded: bool
+    insufficient_evidence: bool
+
+    sources: list[dict[str, Any]]
+
+    citation_validation: dict[str, Any]
+    grounding_validation: Any
+
+    retrieval_stats: dict[str, Any]
+    context_stats: dict[str, Any]
+
+    failure_reasons: list[str]
+
+    repair: dict[str, Any]
+    relevance: dict[str, Any]
+
+    performance: dict[str, float]
+
+
+class EnterpriseAskRequest(BaseModel):
+    """Stable integration contract; retrieval policy stays server-controlled."""
+    query: str = Field(..., min_length=1, max_length=2000)
+
+
+class TemporaryUploadResponse(BaseModel):
+    answer: str
+    sources: list[dict[str, Any]]
+    persisted: bool = False
+
+
+class HealthResponse(BaseModel):
+    status: str
+    pipeline_ready: bool
+
+
+# ============================================================
+# APPLICATION LIFECYCLE
+# ============================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+
+    global pipeline
+
+    api_key = get_required_env("GEMINI_API_KEY")
+
+    model_name = os.getenv(
+        "GEMINI_MODEL",
+        "gemini-3.6-flash",
+    ).strip()
+
+    logger.info(
+        "Initializing IOCL GraphRAG QA pipeline."
+    )
+
+    pipeline = QAPipeline(
+        api_key=api_key,
+        model_name=model_name,
+    )
+
+    logger.info(
+        "IOCL GraphRAG QA pipeline initialized."
+    )
+
+    try:
+        yield
+
+    finally:
+
+        if pipeline is not None:
+
+            logger.info(
+                "Closing IOCL GraphRAG QA pipeline."
+            )
+
+            try:
+                pipeline.close()
+
+            except Exception:
+                logger.exception(
+                    "Error while closing QA pipeline."
+                )
+
+            finally:
+                pipeline = None
+
+
+# ============================================================
+# FASTAPI APPLICATION
+# ============================================================
+
+app = FastAPI(
+    title="IOCL Enterprise GraphRAG API",
+    description=(
+        "Grounded enterprise question-answering API "
+        "powered by hybrid retrieval, semantic reranking, "
+        "citation validation, NLI grounding, and safe "
+        "answer repair."
+    ),
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+
+# ============================================================
+# CORS
+# ============================================================
+
+app.add_middleware(
+    CORSMiddleware,
+
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+
+    allow_credentials=True,
+
+    allow_methods=[
+        "GET",
+        "POST",
+        "OPTIONS",
+    ],
+
+    allow_headers=[
+        "Content-Type",
+        "Authorization",
+    ],
+)
+
+
+# ============================================================
+# HEALTH ENDPOINT
+# ============================================================
+
+@app.get(
+    "/health",
+    response_model=HealthResponse,
+)
+async def health() -> HealthResponse:
+
+    ready = pipeline is not None
+
+    return HealthResponse(
+        status=(
+            "ok"
+            if ready
+            else "initializing"
+        ),
+        pipeline_ready=ready,
+    )
+
+
+# ============================================================
+# ASK ENDPOINT
+# ============================================================
+
+@app.post(
+    "/ask",
+    response_model=AskResponse,
+)
+async def ask(
+    request: AskRequest,
+) -> AskResponse:
+
+    if pipeline is None:
+
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "The QA pipeline is not ready."
+            ),
+        )
+
+    query = request.query.strip()
+
+    if not query:
+
+        raise HTTPException(
+            status_code=400,
+            detail="Query cannot be empty.",
+        )
+
+    try:
+
+        result = await run_in_threadpool(
+            pipeline.run,
+
+            query,
+
+            request.vector_top_k,
+            request.entity_limit,
+            request.relation_limit,
+            request.semantic_min_score,
+            request.hybrid_top_k,
+            request.rerank_top_k,
+        )
+
+        result_dict = asdict(result)
+
+        return AskResponse(
+            **result_dict
+        )
+
+    except ValueError as exc:
+
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        ) from exc
+
+    except Exception:
+
+        logger.exception(
+            "Unexpected failure while processing QA request."
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "The request could not be completed "
+                "because of an internal server error."
+            ),
+        )
+
+
+@app.post("/v1/ask", response_model=AskResponse)
+async def enterprise_ask(request: EnterpriseAskRequest) -> AskResponse:
+    """Recommended IOCL UI endpoint with server-governed retrieval settings."""
+    return await ask(AskRequest(query=request.query))
+
+
+@app.post("/v1/temporary-file", response_model=TemporaryUploadResponse)
+async def temporary_file(
+    request: Request,
+) -> TemporaryUploadResponse:
+    """Analyze a raw binary upload without adding it to the permanent KB.
+
+    The caller supplies ``X-Filename`` and optionally ``X-Instruction`` headers.
+    A raw body avoids coupling IOCL's existing UI to a multipart implementation.
+    """
+    if pipeline is None:
+        raise HTTPException(status_code=503, detail="The QA pipeline is not ready.")
+    filename = request.headers.get("X-Filename", "")
+    instruction = request.headers.get(
+        "X-Instruction", "Summarize this document accurately."
+    )
+    suffix = Path(filename).suffix.lower()
+    if suffix not in SUPPORTED_EXTENSIONS:
+        raise HTTPException(status_code=415, detail="Unsupported document type.")
+
+    max_bytes = int(os.getenv("TEMP_UPLOAD_MAX_BYTES", str(25 * 1024 * 1024)))
+    content_length = int(request.headers.get("content-length", "0") or 0)
+    if content_length > max_bytes:
+        raise HTTPException(status_code=413, detail="Temporary document is too large.")
+    body = bytearray()
+    async for block in request.stream():
+        body.extend(block)
+        if len(body) > max_bytes:
+            raise HTTPException(status_code=413, detail="Temporary document is too large.")
+    payload = bytes(body)
+    if len(payload) > max_bytes:
+        raise HTTPException(status_code=413, detail="Temporary document is too large.")
+
+    with tempfile.TemporaryDirectory(prefix="iocl-adhoc-") as temp_dir:
+        temp_path = Path(temp_dir) / ("upload" + suffix)
+        temp_path.write_bytes(payload)
+        records = await run_in_threadpool(load_document, temp_path, temp_path.parent)
+        chunks = prepare_chunks(chunk_documents(records))[:12]
+        generated = await run_in_threadpool(
+            pipeline.generator.generate,
+            instruction.strip() or "Summarize this document accurately.",
+            chunks,
+        )
+        return TemporaryUploadResponse(
+            answer=generated.answer,
+            sources=generated.sources,
+            persisted=False,
+        )
+
+
+# ============================================================
+# ROOT ENDPOINT
+# ============================================================
+
+@app.get(
+    "/",
+    include_in_schema=False,
+)
+async def root():
+
+    ui_path = os.path.join(
+        os.path.dirname(__file__),
+        "index.html",
+    )
+
+    return FileResponse(
+        ui_path
+    )
